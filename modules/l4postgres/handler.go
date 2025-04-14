@@ -16,7 +16,8 @@
 package l4postgres
 
 import (
-	"bufio"
+	"encoding/binary"
+	"io"
 	"net"
 
 	"github.com/caddyserver/caddy/v2"
@@ -59,10 +60,38 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // Handle handles the connection.
 func (h *Handler) Handle(cx *layer4.Connection, next layer4.Handler) error {
-	cx.Conn = &pgConn{
-		Conn:        cx.Conn,
-		logger:      h.logger.Named("conn"),
-		sslRequired: h.SSLRequired,
+	// 读取前8字节 (PostgreSQL SSLRequest 消息长度+代码)
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(cx.Conn, header); err != nil {
+		return err
+	}
+
+	// 检查是否为 SSLRequest (80877103)
+	if binary.BigEndian.Uint32(header[4:]) == 80877103 {
+		// 根据配置回复 'S' 或 'N'
+		var response byte
+		if h.SSLRequired {
+			response = sslRequiredReply
+		} else {
+			response = plaintextReply
+		}
+
+		if _, err := cx.Conn.Write([]byte{response}); err != nil {
+			return err
+		}
+
+		h.logger.Debug("PostgreSQL SSL request detected",
+			zap.String("remote", cx.Conn.RemoteAddr().String()),
+			zap.Bool("ssl_required", h.SSLRequired))
+	} else {
+		// 如果不是 SSLRequest，把读取的数据放回"连接"中
+		h.logger.Debug("PostgreSQL SSL request not detected, passing through data",
+			zap.String("remote", cx.Conn.RemoteAddr().String()),
+			zap.Int("bytes", len(header)))
+		cx.Conn = &bufferPrependConn{
+			Conn:   cx.Conn,
+			buffer: header,
+		}
 	}
 
 	// 将连接传递给下一个处理程序
@@ -110,51 +139,36 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-type pgConn struct {
+// 实现一个能将数据预置到连接前端的包装器
+type bufferPrependConn struct {
 	net.Conn
-	sslRequired bool
-	logger      *zap.Logger
-
-	replySent bool // Whether we have sent the postgres reply
+	buffer    []byte
+	bufferPos int
 }
 
-// Read reads data from the connection.
-// If this is a PostgreSQL TLS connection, it handles the SSL request message. If
-// it is a plaintext connection, it just passes through the data.
-func (c *pgConn) Read(b []byte) (int, error) {
-	if c.replySent {
-		c.logger.Debug("reply already sent, passing through data",
-			zap.String("remote", c.RemoteAddr().String()),
-			zap.Int("bytes", len(b)))
-		return c.Conn.Read(b)
-	}
-	br := bufio.NewReaderSize(c.Conn, 4096)
-	_, err := br.Discard(8) // 8 bytes for the length field
-	if err != nil {
-		return 0, err
-	}
+// 重写 Read 方法，先读取缓冲区中的数据
+func (c *bufferPrependConn) Read(b []byte) (n int, err error) {
+	// 先读取缓冲区中的数据
+	if len(c.buffer) > c.bufferPos {
+		n = copy(b, c.buffer[c.bufferPos:])
+		c.bufferPos += n
 
-	if c.sslRequired {
-		_, err = c.Conn.Write([]byte{sslRequiredReply})
-	} else {
-		_, err = c.Conn.Write([]byte{plaintextReply})
+		// 如果缓冲区已读完，清除它
+		if c.bufferPos >= len(c.buffer) {
+			c.buffer = nil
+			c.bufferPos = 0
+		}
+
+		return n, nil
 	}
 
-	if err != nil {
-		return 0, err
-	}
-	c.replySent = true
-
-	c.logger.Debug("read",
-		zap.String("remote", c.RemoteAddr().String()),
-		zap.Int("bytes", len(b)),
-		zap.Error(err))
-
-	return br.Read(b)
+	// 缓冲区为空，直接从连接读取
+	return c.Conn.Read(b)
 }
 
 // Interface guards
 var (
 	_ caddyfile.Unmarshaler = (*Handler)(nil)
+	_ caddy.Provisioner     = (*Handler)(nil)
 	_ layer4.NextHandler    = (*Handler)(nil)
 )
