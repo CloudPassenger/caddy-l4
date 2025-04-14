@@ -16,8 +16,12 @@
 package l4postgres
 
 import (
+	"bufio"
+	"net"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"go.uber.org/zap"
 
 	"github.com/mholt/caddy-l4/layer4"
 )
@@ -35,6 +39,8 @@ const (
 type Handler struct {
 	// Whether SSL is required for PostgreSQL connections
 	SSLRequired bool `json:"ssl_required,omitempty"`
+
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -45,19 +51,18 @@ func (*Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// Provision sets up the handler.
+func (h *Handler) Provision(ctx caddy.Context) error {
+	h.logger = ctx.Logger(h)
+	return nil
+}
+
 // Handle handles the connection.
 func (h *Handler) Handle(cx *layer4.Connection, next layer4.Handler) error {
-	// 根据 SSLRequired 设置发送响应字节
-	var response byte
-	if h.SSLRequired {
-		response = sslRequiredReply // 'S'
-	} else {
-		response = plaintextReply // 'N'
-	}
-
-	// 向客户端写入响应字节
-	if _, err := cx.Write([]byte{response}); err != nil {
-		return err
+	cx.Conn = &pgConn{
+		Conn:        cx.Conn,
+		logger:      h.logger.Named("conn"),
+		sslRequired: h.SSLRequired,
 	}
 
 	// 将连接传递给下一个处理程序
@@ -103,6 +108,49 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 
 	return nil
+}
+
+type pgConn struct {
+	net.Conn
+	sslRequired bool
+	logger      *zap.Logger
+
+	replySent bool // Whether we have sent the postgres reply
+}
+
+// Read reads data from the connection.
+// If this is a PostgreSQL TLS connection, it handles the SSL request message. If
+// it is a plaintext connection, it just passes through the data.
+func (c *pgConn) Read(b []byte) (int, error) {
+	if c.replySent {
+		c.logger.Debug("reply already sent, passing through data",
+			zap.String("remote", c.RemoteAddr().String()),
+			zap.Int("bytes", len(b)))
+		return c.Conn.Read(b)
+	}
+	br := bufio.NewReaderSize(c.Conn, 4096)
+	_, err := br.Discard(8) // 8 bytes for the length field
+	if err != nil {
+		return 0, err
+	}
+
+	if c.sslRequired {
+		_, err = c.Conn.Write([]byte{sslRequiredReply})
+	} else {
+		_, err = c.Conn.Write([]byte{plaintextReply})
+	}
+
+	if err != nil {
+		return 0, err
+	}
+	c.replySent = true
+
+	c.logger.Debug("read",
+		zap.String("remote", c.RemoteAddr().String()),
+		zap.Int("bytes", len(b)),
+		zap.Error(err))
+
+	return br.Read(b)
 }
 
 // Interface guards
